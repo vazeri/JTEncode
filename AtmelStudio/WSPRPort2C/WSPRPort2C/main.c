@@ -1,18 +1,23 @@
--/*
+/*
 3 Marzo 2018 - Erick Vazquez Gonzalez erick@ahorratec.org
 Este algoritmo es un port de C++ a C de la codification WSPR
-
 */
 #include <atmel_start.h>
+#include <string.h>
+#include <ctype.h>
+#include <stdlib.h>
+#include <stdint.h>
+#include <stdio.h>
 
 //Extracto de JTEncode.h (Omitiendo todos los protocolos que no son WSPR)
 
 #define WSPR_SYMBOL_COUNT                   162
 #define WSPR_BIT_COUNT                      162
-
+#define NGLYPHS         (sizeof(fsq_code_table)/sizeof(fsq_code_table[0]))
+ 
 typedef struct fsq_varicode		//Define la estructura de la tabla de caracteres (2 elementos)
 {	uint8_t ch;
-	uint8_t var[2];				//2 elementos, podremos ajustar el arreglo y amplificar los caracteres 
+	uint8_t var[2];				//2 elementos, podemos ajustar el arreglo y amplificar el numero de bytes en el CRC 
 } Varicode;
 
 // The FSQ varicode table, based on the FSQ Varicode V3.0--- Revisar el documento
@@ -127,7 +132,7 @@ const Varicode fsq_code_table[] PROGMEM =	//Por alguna razon no se utilizado 2^8
 	{8,   {27, 31}}  // BS
 };
 
-const uint8_t crc8_table[] PROGMEM = {				//Redudancia ciclica,  
+const uint8_t crc8_table[] PROGMEM = {				//Redudancia ciclica, de un solo Byte (8 bits)
 	0x00, 0x07, 0x0e, 0x09, 0x1c, 0x1b, 0x12, 0x15, 0x38, 0x3f, 0x36, 0x31,
 	0x24, 0x23, 0x2a, 0x2d, 0x70, 0x77, 0x7e, 0x79, 0x6c, 0x6b, 0x62, 0x65,
 	0x48, 0x4f, 0x46, 0x41, 0x54, 0x53, 0x5a, 0x5d, 0xe0, 0xe7, 0xee, 0xe9,
@@ -161,9 +166,216 @@ int main(void)
 	/* Replace with your application code */
 	while (1) {
 		
+		void wspr_encode(const char * call, const char * loc, const uint8_t dbm, uint8_t * symbols)
+		{
+			char call_[7];
+			char loc_[5];
+			uint8_t dbm_ = dbm;
+			strcpy(call_, call);
+			strcpy(loc_, loc);
+
+			// Ensure that the message text conforms to standards
+			// --------------------------------------------------
+			wspr_message_prep(call_, loc_, dbm_);
+
+			// Bit packing
+			// -----------
+			uint8_t c[11];
+			wspr_bit_packing(c);
+
+			// Convolutional Encoding
+			// ---------------------
+			uint8_t s[WSPR_SYMBOL_COUNT];
+			convolve(c, s, 11, WSPR_BIT_COUNT);
+
+			// Interleaving
+			// ------------
+			wspr_interleave(s);
+
+			// Merge with sync vector
+			// ----------------------
+			wspr_merge_sync_vector(s, symbols);
+		}
+		
+		int wspr_code(char c)
+		{
+			// Validate the input then return the proper integer code.
+			// Return 255 as an error code if the char is not allowed.
+
+			if(isdigit(c))
+			{
+				return (uint8_t)(c - 48);
+			}
+			else if(c == ' ')
+			{
+				return 36;
+			}
+			else if(c >= 'A' && c <= 'Z')
+			{
+				return (uint8_t)(c - 55);
+			}
+			else
+			{
+				return 255;
+			}
+		}
+		
+		int wspr_message_prep(char * call, char * loc, uint8_t dbm)
+		{
+			// Callsign validation and padding
+			// -------------------------------
+
+			// If only the 2nd character is a digit, then pad with a space.
+			// If this happens, then the callsign will be truncated if it is
+			// longer than 5 characters.
+			if((call[1] >= '0' && call[1] <= '9') && (call[2] < '0' || call[2] > '9'))
+			{
+				memmove(call + 1, call, 5);
+				call[0] = ' ';
+			}
+
+			// Now the 3rd charcter in the callsign must be a digit
+			if(call[2] < '0' || call[2] > '9')
+			{
+				// TODO: need a better way to handle this
+				call[2] = '0';
+			}
+
+			// Ensure that the only allowed characters are digits and
+			// uppercase letters
+			uint8_t i;
+			for(i = 0; i < 6; i++)
+			{
+				call[i] = toupper(call[i]);
+				if(!(isdigit(call[i]) || isupper(call[i])))
+				{
+					call[i] = ' ';
+				}
+			}
+
+			memcpy(callsign, call, 6);
+
+			// Grid locator validation
+			for(i = 0; i < 4; i++)
+			{
+				loc[i] = toupper(loc[i]);
+				if(!(isdigit(loc[i]) || (loc[i] >= 'A' && loc[i] <= 'R')))
+				{
+					memcpy(loc, "AA00", 5);
+					//loc = "AA00";
+				}
+			}
+
+			memcpy(locator, loc, 4);
+
+			// Power level validation
+			// Only certain increments are allowed
+			if(dbm > 60)
+			{
+				dbm = 60;
+			}
+			const uint8_t valid_dbm[19] =
+			{0, 3, 7, 10, 13, 17, 20, 23, 27, 30, 33, 37, 40,
+			43, 47, 50, 53, 57, 60};
+			for(i = 0; i < 19; i++)
+			{
+				if(dbm == valid_dbm[i])
+				{
+					power = dbm;
+				}
+			}
+			// If we got this far, we have an invalid power level, so we'll round down
+			for(i = 1; i < 19; i++)
+			{
+				if(dbm < valid_dbm[i] && dbm >= valid_dbm[i - 1])
+				{
+					power = valid_dbm[i - 1];
+				}
+			}
+		}
+		
+		int wspr_bit_packing(uint8_t * c)
+		{
+			uint32_t n, m;
+
+			n = wspr_code(callsign[0]);
+			n = n * 36 + wspr_code(callsign[1]);
+			n = n * 10 + wspr_code(callsign[2]);
+			n = n * 27 + (wspr_code(callsign[3]) - 10);
+			n = n * 27 + (wspr_code(callsign[4]) - 10);
+			n = n * 27 + (wspr_code(callsign[5]) - 10);
+
+			m = ((179 - 10 * (locator[0] - 'A') - (locator[2] - '0')) * 180) +
+			(10 * (locator[1] - 'A')) + (locator[3] - '0');
+			m = (m * 128) + power + 64;
+
+			// Callsign is 28 bits, locator/power is 22 bits.
+			// A little less work to start with the least-significant bits
+			c[3] = (uint8_t)((n & 0x0f) << 4);
+			n = n >> 4;
+			c[2] = (uint8_t)(n & 0xff);
+			n = n >> 8;
+			c[1] = (uint8_t)(n & 0xff);
+			n = n >> 8;
+			c[0] = (uint8_t)(n & 0xff);
+
+			c[6] = (uint8_t)((m & 0x03) << 6);
+			m = m >> 2;
+			c[5] = (uint8_t)(m & 0xff);
+			m = m >> 8;
+			c[4] = (uint8_t)(m & 0xff);
+			m = m >> 8;
+			c[3] |= (uint8_t)(m & 0x0f);
+			c[7] = 0;
+			c[8] = 0;
+			c[9] = 0;
+			c[10] = 0;
+		}
 		
 		
 		
+		void wspr_merge_sync_vector(uint8_t * g, uint8_t * symbols)
+		{
+			uint8_t i;
+			const uint8_t sync_vector[WSPR_SYMBOL_COUNT] =
+			{1, 1, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 1, 1, 1, 0, 0, 0, 1, 0, 0,
+				1, 0, 1, 1, 1, 1, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 1, 0, 1, 0, 0,
+				0, 0, 0, 0, 1, 0, 1, 1, 0, 0, 1, 1, 0, 1, 0, 0, 0, 1, 1, 0, 1,
+				0, 0, 0, 0, 1, 1, 0, 1, 0, 1, 0, 1, 0, 1, 0, 0, 1, 0, 0, 1, 0,
+				1, 1, 0, 0, 0, 1, 1, 0, 1, 0, 1, 0, 0, 0, 1, 0, 0, 0, 0, 0, 1,
+				0, 0, 1, 0, 0, 1, 1, 1, 0, 1, 1, 0, 0, 1, 1, 0, 1, 0, 0, 0, 1,
+				1, 1, 0, 0, 0, 0, 0, 1, 0, 1, 0, 0, 1, 1, 0, 0, 0, 0, 0, 0, 0,
+			1, 1, 0, 1, 0, 1, 1, 0, 0, 0, 1, 1, 0, 0, 0};
+
+			for(i = 0; i < WSPR_SYMBOL_COUNT; i++)
+			{
+				symbols[i] = sync_vector[i] + (2 * g[i]);
+			}
+		}
 		
+		
+		
+		void crc8(const char * text)
+		{
+			uint8_t crc = '\0';
+			uint8_t ch;
+
+			int i;
+			for(i = 0; i < strlen(text); i++)
+			{
+				ch = text[i];
+				//#if defined(__AVR_ATmega328P__) || defined(__AVR_ATmega168__) || defined(__AVR_ATmega32U4__) || defined(__AVR_ATmega16U4__)
+				#if defined(__arm__)
+				crc = crc8_table[(crc) ^ ch];
+				#else
+				crc = pgm_read_byte(&(crc8_table[(crc) ^ ch]));
+				#endif
+				crc &= 0xFF;
+			}
+
+			return crc;
+		}
+
+
 	}
 }
