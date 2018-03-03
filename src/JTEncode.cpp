@@ -419,7 +419,7 @@ uint8_t JTEncode::jt_code(char c)
   {
     return (uint8_t)(c - 55);
   }
-  else if(c == ' ')
+  ele if(c == ' ')
   {
     return 36;
   }
